@@ -56,18 +56,57 @@ If `MODEL_MAP` is set, it is merged over those defaults.
 
 ## Quick Start
 
-### Linux / macOS
+### Prerequisites
 
-Build and run manually:
+| | Linux / macOS | Windows |
+|---|---|---|
+| **Rust 1.70+** | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | Download from [rustup.rs](https://rustup.rs/) |
+| **C/C++ toolchain** | Usually pre-installed (`gcc` / `clang`) | [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) — select "Desktop development with C++" workload |
+| **Git** | Usually pre-installed | [Git for Windows](https://git-scm.com/download/win) |
 
+> **Windows alternative:** To avoid Visual Studio, you can use the GNU toolchain:
+> ```powershell
+> rustup toolchain install stable-x86_64-pc-windows-gnu
+> rustup default stable-x86_64-pc-windows-gnu
+> ```
+
+### Install via script
+
+**Linux / macOS:**
 ```bash
+curl -sSf https://raw.githubusercontent.com/c2js/claudecode-openai-proxy-rs/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/c2js/claudecode-openai-proxy-rs/main/install.ps1 | iex
+```
+
+Both scripts run `cargo install --locked --git` under the hood. Run with `--help` for options (e.g. `--branch`, `--tag`, `--force`).
+
+### Build from source
+
+**Linux / macOS:**
+```bash
+git clone https://github.com/c2js/claudecode-openai-proxy-rs.git
+cd claudecode-openai-proxy-rs
 cargo build --release
-cp .env.example .env
+cp .env.example .env       # edit .env with your settings
 ./target/release/ao-proxy
 ```
 
-With Claude Code:
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/c2js/claudecode-openai-proxy-rs.git
+cd claudecode-openai-proxy-rs
+cargo build --release
+Copy-Item .env.example .env   # edit .env with your settings
+.\target\release\ao-proxy.exe
+```
 
+### Run with Claude Code
+
+**Linux / macOS:**
 ```bash
 # Terminal 1
 ao-proxy
@@ -76,34 +115,7 @@ ao-proxy
 ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY="any-value" claude
 ```
 
-> **Note:** Claude Code requires `ANTHROPIC_API_KEY` to be set. Since authentication is handled by the upstream provider (via `UPSTREAM_API_KEY`), this proxy does not validate the key — any non-empty value will work (e.g. `ANTHROPIC_API_KEY="any-value"`).
-
-### Windows
-
-Prerequisites:
-- **Rust (1.70+)** — Download from https://rustup.rs/
-- **Visual Studio C++ Build Tools** — Required for the MSVC linker and Windows SDK. Install via [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and select the "Desktop development with C++" workload. This provides `link.exe` and the Windows system libraries that Rust needs.
-- **Git for Windows**
-
-Alternatively, if you prefer the GNU toolchain instead of MSVC:
-
-```bash
-rustup toolchain install stable-x86_64-pc-windows-gnu
-rustup default stable-x86_64-pc-windows-gnu
-```
-
-This uses MinGW's `gcc` linker and avoids needing Visual Studio, but MSVC is the default and recommended target on Windows.
-
-Build:
-
-```powershell
-cargo build --release
-Copy-Item .env.example .env
-.\target\release\ao-proxy.exe
-```
-
-With Claude Code on Windows (PowerShell):
-
+**Windows (PowerShell):**
 ```powershell
 # Terminal 1
 .\target\release\ao-proxy.exe
@@ -114,8 +126,7 @@ $env:ANTHROPIC_API_KEY='any-value'
 claude
 ```
 
-With Claude Code on Windows (Git Bash / WSL):
-
+**Windows (Git Bash / WSL):**
 ```bash
 # Terminal 1
 ./target/release/ao-proxy.exe
@@ -123,6 +134,8 @@ With Claude Code on Windows (Git Bash / WSL):
 # Terminal 2
 ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY="any-value" claude
 ```
+
+> **Note:** Claude Code requires `ANTHROPIC_API_KEY` to be set. Since authentication is handled by the upstream provider (via `UPSTREAM_API_KEY`), this proxy does not validate the key — any non-empty value will work (e.g. `ANTHROPIC_API_KEY="any-value"`).
 
 ## Configuration
 
@@ -171,8 +184,9 @@ The proxy searches for `.env` files in this order:
 
 1. Path from `--config`
 2. Current working directory as `.env`
-3. `~/.ao-proxy.env` (`%USERPROFILE%\.ao-proxy.env` on Windows)
-4. `/etc/ao-proxy/.env` (Unix only)
+3. Executable directory as `.ao-proxy.env`
+4. `~/.ao-proxy.env` (`%USERPROFILE%\.ao-proxy.env` on Windows)
+5. `/etc/ao-proxy/.env` (Unix only)
 
 ## Azure OpenAI
 
@@ -332,7 +346,9 @@ Tool or streaming issues:
 ## Development
 
 ```bash
-cargo test
+cargo test                          # Run tests
+cargo clippy -- -D warnings         # Lint
+cargo build --release               # Release build
 ```
 
 ## License
