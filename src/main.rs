@@ -1,3 +1,4 @@
+mod azure;
 mod cli;
 mod config;
 mod error;
@@ -10,9 +11,8 @@ use axum::{
     Extension, Router,
 };
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::Cli;
 use config::Config;
-use daemonize::Daemonize;
 use reqwest::Client;
 use std::sync::Arc;
 use tower_http::{
@@ -20,53 +20,85 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::fmt::time::FormatTime;
+
+struct SecondTimer;
+
+struct ShortTargetFormatter;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for ShortTargetFormatter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use tracing::Level;
+
+        // Dimmed timestamp
+        write!(writer, "\x1b[2m")?;
+        SecondTimer.format_time(&mut writer)?;
+        write!(writer, "\x1b[0m")?;
+
+        let level = *event.metadata().level();
+        let color = match level {
+            Level::ERROR => "\x1b[31m", // red
+            Level::WARN  => "\x1b[33m", // yellow
+            Level::INFO  => "\x1b[32m", // green
+            Level::DEBUG => "\x1b[34m", // blue
+            Level::TRACE => "\x1b[35m", // magenta
+        };
+        write!(writer, " {}{:>5}\x1b[0m ", color, level)?;
+
+        let target = event.metadata().target();
+        let short_target = target.rsplit("::").next().unwrap_or(target);
+        write!(writer, "\x1b[2m{}:\x1b[0m ", short_target)?;
+        _ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+impl tracing_subscriber::fmt::time::FormatTime for SecondTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        // 2026-04-09T14:00:59Z
+        let days = secs / 86400;
+        let time_secs = secs % 86400;
+        let h = time_secs / 3600;
+        let m = (time_secs % 3600) / 60;
+        let s = time_secs % 60;
+        // Days since epoch to Y-M-D
+        let (y, mo, d) = epoch_days_to_ymd(days as i64);
+        write!(w, "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+    }
+}
+
+fn epoch_days_to_ymd(mut days: i64) -> (i64, u32, u32) {
+    // Civil days algorithm from Howard Hinnant
+    days += 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = (days - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if let Some(command) = cli.command {
-        match command {
-            Command::Stop { pid_file } => {
-                stop_daemon(&pid_file)?;
-                return Ok(());
-            }
-            Command::Status { pid_file } => {
-                check_status(&pid_file)?;
-                return Ok(());
-            }
-        }
-    }
-
-    if cli.daemon {
-        use std::fs::OpenOptions;
-
-        let stdout = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/anthropic-proxy.log")?;
-
-        let stderr = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/anthropic-proxy.log")?;
-
-        let daemonize = Daemonize::new()
-            .pid_file(&cli.pid_file)
-            .working_directory(std::env::current_dir()?)
-            .stdout(stdout)
-            .stderr(stderr)
-            .umask(0o027);
-
-        match daemonize.start() {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("✗ Failed to daemonize: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        eprintln!("✓ Starting proxy in foreground mode");
-    }
+    eprintln!("✓ Starting proxy in foreground mode");
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async_main(cli))
@@ -96,9 +128,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("anthropic_proxy={}", log_level).into()),
+                .unwrap_or_else(|_| format!("ao_proxy={}", log_level).into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer()
+            .with_timer(SecondTimer)
+            .with_target(true)
+            .fmt_fields(tracing_subscriber::fmt::format::DefaultFields::new())
+            .event_format(ShortTargetFormatter)
+        )
         .init();
 
     tracing::info!("Starting Anthropic Proxy v{}", env!("CARGO_PKG_VERSION"));
@@ -114,11 +151,36 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  {} -> {}", from, to);
         }
     }
-    if config.api_key.is_some() {
+    if config.is_azure() {
+        tracing::info!(
+            "Azure OpenAI: endpoint={}",
+            config.azure_openai_endpoint.as_deref().unwrap_or("?")
+        );
+        if config.azure_use_cli_credential {
+            tracing::info!("Azure auth: az CLI credential (az login)");
+        } else if config.api_key.is_some() {
+            tracing::info!("Azure auth: API key");
+        } else {
+            tracing::info!("Azure auth: none configured");
+        }
+    } else if config.api_key.is_some() {
         tracing::info!("API Key: configured");
     } else {
         tracing::info!("API Key: not set (using unauthenticated endpoint)");
     }
+
+    // Create Azure CLI credential if configured
+    let azure_credential = if config.azure_use_cli_credential && config.is_azure() {
+        let cred = azure::AzureCliCredential::new();
+        // Validate credential on startup
+        match cred.get_token().await {
+            Ok(_) => tracing::info!("Azure CLI credential: validated"),
+            Err(e) => tracing::warn!("Azure CLI credential: initial token fetch failed ({}). Will retry on first request.", e),
+        }
+        Some(cred)
+    } else {
+        None
+    };
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -139,6 +201,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .route("/health", axum::routing::get(health_handler))
         .layer(Extension(config.clone()))
         .layer(Extension(client))
+        .layer(Extension(azure_credential))
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
@@ -155,83 +218,4 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
 async fn health_handler() -> &'static str {
     "OK"
-}
-
-fn stop_daemon(pid_file: &std::path::Path) -> anyhow::Result<()> {
-    if !pid_file.exists() {
-        eprintln!("✗ PID file not found: {}", pid_file.display());
-        eprintln!("  Daemon is not running or PID file was removed");
-        std::process::exit(1);
-    }
-
-    let pid_str = std::fs::read_to_string(pid_file)?;
-    let pid: i32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid PID in file: {}", pid_str))?;
-
-    #[cfg(unix)]
-    {
-        use std::process::Command;
-        let output = Command::new("kill").arg(pid.to_string()).output()?;
-
-        if output.status.success() {
-            std::fs::remove_file(pid_file)?;
-            eprintln!("✓ Daemon stopped (PID: {})", pid);
-        } else {
-            eprintln!("✗ Failed to stop daemon (PID: {})", pid);
-            eprintln!("  Process may have already exited");
-            std::fs::remove_file(pid_file)?;
-            std::process::exit(1);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        eprintln!("✗ Daemon stop is only supported on Unix systems");
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-fn check_status(pid_file: &std::path::Path) -> anyhow::Result<()> {
-    if !pid_file.exists() {
-        eprintln!("✗ Daemon is not running");
-        eprintln!("  PID file not found: {}", pid_file.display());
-        std::process::exit(1);
-    }
-
-    let pid_str = std::fs::read_to_string(pid_file)?;
-    let pid: i32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid PID in file: {}", pid_str))?;
-
-    #[cfg(unix)]
-    {
-        use std::process::Command;
-        let output = Command::new("ps").arg("-p").arg(pid.to_string()).output()?;
-
-        if output.status.success() {
-            eprintln!("✓ Daemon is running (PID: {})", pid);
-            eprintln!("  PID file: {}", pid_file.display());
-        } else {
-            eprintln!("✗ Daemon is not running");
-            eprintln!(
-                "  Stale PID file found: {} (PID: {})",
-                pid_file.display(),
-                pid
-            );
-            std::process::exit(1);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        eprintln!("✗ Daemon status check is only supported on Unix systems");
-        std::process::exit(1);
-    }
-
-    Ok(())
 }

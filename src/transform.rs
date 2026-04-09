@@ -93,7 +93,7 @@ pub fn anthropic_to_responses(
         upstream_request: responses::ResponsesRequest {
             model: upstream_model,
             input,
-            max_output_tokens: Some(req.max_tokens),
+            max_output_tokens: Some(req.max_tokens.max(16)),
             stream: req.stream,
             tools,
             tool_choice,
@@ -738,7 +738,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            port: 3000,
+            port: 18080,
             base_url: "https://api.openai.com".to_string(),
             api_key: None,
             model_map: HashMap::from([
@@ -748,6 +748,8 @@ mod tests {
             ]),
             debug: false,
             verbose: false,
+            azure_openai_endpoint: None,
+            azure_use_cli_credential: false,
         }
     }
 

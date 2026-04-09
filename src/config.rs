@@ -11,6 +11,10 @@ pub struct Config {
     pub model_map: HashMap<String, String>,
     pub debug: bool,
     pub verbose: bool,
+    /// Azure OpenAI resource endpoint (e.g. `https://myresource.openai.azure.com`)
+    pub azure_openai_endpoint: Option<String>,
+    /// Use `az login` CLI credential for Azure OpenAI authentication
+    pub azure_use_cli_credential: bool,
 }
 
 impl Config {
@@ -29,19 +33,38 @@ impl Config {
             return Some(path);
         }
 
-        if let Ok(home) = env::var("HOME") {
-            let home_config = PathBuf::from(home).join(".anthropic-proxy.env");
+        if let Ok(exe) = env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_config = exe_dir.join(".ao-proxy.env");
+                if exe_config.exists() && dotenvy::from_path(&exe_config).is_ok() {
+                    return Some(exe_config);
+                }
+            }
+        }
+
+        if let Some(home) = Self::home_dir() {
+            let home_config = home.join(".ao-proxy.env");
             if home_config.exists() && dotenvy::from_path(&home_config).is_ok() {
                 return Some(home_config);
             }
         }
 
-        let etc_config = PathBuf::from("/etc/anthropic-proxy/.env");
-        if etc_config.exists() && dotenvy::from_path(&etc_config).is_ok() {
-            return Some(etc_config);
+        #[cfg(unix)]
+        {
+            let etc_config = PathBuf::from("/etc/ao-proxy/.env");
+            if etc_config.exists() && dotenvy::from_path(&etc_config).is_ok() {
+                return Some(etc_config);
+            }
         }
 
         None
+    }
+
+    fn home_dir() -> Option<PathBuf> {
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .ok()
+            .map(PathBuf::from)
     }
 
     pub fn from_env_with_path(custom_path: Option<PathBuf>) -> Result<Self> {
@@ -54,20 +77,33 @@ impl Config {
         let port = env::var("PORT")
             .ok()
             .and_then(|p| p.parse().ok())
-            .unwrap_or(3000);
+            .unwrap_or(18080);
 
-        let base_url = env::var("UPSTREAM_BASE_URL")
-            .or_else(|_| env::var("ANTHROPIC_PROXY_BASE_URL"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "UPSTREAM_BASE_URL is required. Set it to your OpenAI-compatible endpoint.\n\
-                Examples:\n\
-                  - OpenRouter: https://openrouter.ai/api\n\
-                  - OpenAI: https://api.openai.com\n\
-                  - Versioned gateway: https://gateway.example.com/v2\n\
-                  - Local: http://localhost:11434"
-                )
-            })?;
+        let azure_openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT")
+            .ok()
+            .filter(|v| !v.is_empty());
+
+        let azure_use_cli_credential = env::var("AZURE_USE_CLI_CREDENTIAL")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let base_url = if let Some(ref endpoint) = azure_openai_endpoint {
+            // Azure mode: derive base_url from the Azure endpoint
+            format!("{}/openai", endpoint.trim_end_matches('/'))
+        } else {
+            env::var("UPSTREAM_BASE_URL")
+                .or_else(|_| env::var("ANTHROPIC_PROXY_BASE_URL"))
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "UPSTREAM_BASE_URL (or AZURE_OPENAI_ENDPOINT) is required.\n\
+                    Examples:\n\
+                      - OpenRouter: https://openrouter.ai/api\n\
+                      - OpenAI: https://api.openai.com\n\
+                      - Azure: AZURE_OPENAI_ENDPOINT=https://myresource.openai.azure.com\n\
+                      - Local: http://localhost:11434"
+                    )
+                })?
+        };
 
         Self::validate_base_url(&base_url)?;
 
@@ -86,6 +122,13 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        if azure_use_cli_credential && azure_openai_endpoint.is_none() {
+            eprintln!(
+                "⚠️  AZURE_USE_CLI_CREDENTIAL is set but AZURE_OPENAI_ENDPOINT is not. \
+                 CLI credential will be ignored."
+            );
+        }
+
         Ok(Config {
             port,
             base_url,
@@ -93,6 +136,8 @@ impl Config {
             model_map,
             debug,
             verbose,
+            azure_openai_endpoint,
+            azure_use_cli_credential,
         })
     }
 
@@ -137,8 +182,15 @@ impl Config {
     }
 
     pub fn responses_url(&self) -> String {
+        if let Some(ref endpoint) = self.azure_openai_endpoint {
+            return crate::azure::azure_responses_url(endpoint);
+        }
         Self::resolve_responses_url(&self.base_url)
             .expect("UPSTREAM_BASE_URL should be validated during configuration loading")
+    }
+
+    pub fn is_azure(&self) -> bool {
+        self.azure_openai_endpoint.is_some()
     }
 
     fn validate_base_url(base_url: &str) -> Result<()> {

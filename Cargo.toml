@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "process"] }
 
 # Web framework
 axum = { version = "0.7", features = ["http2"] }
@@ -42,9 +42,6 @@ dotenvy = "0.15"
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }
-
-# Daemonize
-daemonize = "0.5"
 
 # Server utilities
 tower = { version = "0.5", features = ["util"] }

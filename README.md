@@ -73,7 +73,7 @@ With Claude Code:
 ao-proxy
 
 # Terminal 2
-ANTHROPIC_BASE_URL=http://localhost:3000 ANTHROPIC_API_KEY="any-value" claude
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY="any-value" claude
 ```
 
 > **Note:** Claude Code requires `ANTHROPIC_API_KEY` to be set. Since authentication is handled by the upstream provider (via `UPSTREAM_API_KEY`), this proxy does not validate the key — any non-empty value will work (e.g. `ANTHROPIC_API_KEY="any-value"`).
@@ -109,7 +109,7 @@ With Claude Code on Windows (PowerShell):
 .\target\release\ao-proxy.exe
 
 # Terminal 2
-$env:ANTHROPIC_BASE_URL='http://localhost:3000'
+$env:ANTHROPIC_BASE_URL='http://localhost:18080'
 $env:ANTHROPIC_API_KEY='any-value'
 claude
 ```
@@ -121,7 +121,7 @@ With Claude Code on Windows (Git Bash / WSL):
 ./target/release/ao-proxy.exe
 
 # Terminal 2
-ANTHROPIC_BASE_URL=http://localhost:3000 ANTHROPIC_API_KEY="any-value" claude
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY="any-value" claude
 ```
 
 ## Configuration
@@ -134,10 +134,7 @@ ao-proxy --help
 
 Commands:
 
-| Command | Description |
-|---------|-------------|
-| `stop` | Stop running daemon |
-| `status` | Check daemon status |
+*None — the proxy runs in foreground mode only.*
 
 Options:
 
@@ -147,19 +144,21 @@ Options:
 | `--debug` | `-d` | Enable debug logging |
 | `--verbose` | `-v` | Enable verbose request and response logging |
 | `--port <PORT>` | `-p` | Port to listen on |
-| `--daemon` | | Run as background daemon |
-| `--pid-file <FILE>` | | PID file path |
 
 ### Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `UPSTREAM_BASE_URL` | Yes | - | OpenAI-compatible base URL or full Responses endpoint |
-| `UPSTREAM_API_KEY` | No | - | Bearer token for upstream service |
+| `UPSTREAM_BASE_URL` | Yes* | - | OpenAI-compatible base URL or full Responses endpoint |
+| `UPSTREAM_API_KEY` | No | - | Bearer token for upstream service (or Azure API key) |
 | `MODEL_MAP` | No | Built-in defaults | Inline JSON or path to JSON file |
-| `PORT` | No | `3000` | Listen port |
+| `PORT` | No | `18080` | Listen port |
 | `DEBUG` | No | `false` | Enable debug logs |
 | `VERBOSE` | No | `false` | Enable verbose logs |
+| `AZURE_OPENAI_ENDPOINT` | No | - | Azure OpenAI resource endpoint (replaces `UPSTREAM_BASE_URL`) |
+| `AZURE_USE_CLI_CREDENTIAL` | No | `false` | Use `az login` for Azure authentication |
+
+\* Not required when `AZURE_OPENAI_ENDPOINT` is set.
 
 `UPSTREAM_BASE_URL` accepts:
 
@@ -172,8 +171,66 @@ The proxy searches for `.env` files in this order:
 
 1. Path from `--config`
 2. Current working directory as `.env`
-3. `~/.ao-proxy.env`
-4. `/etc/ao-proxy/.env`
+3. `~/.ao-proxy.env` (`%USERPROFILE%\.ao-proxy.env` on Windows)
+4. `/etc/ao-proxy/.env` (Unix only)
+
+## Azure OpenAI
+
+The proxy supports Azure OpenAI with either API key or Azure CLI credential (`az login`) authentication.
+
+### Setup
+
+1. Set `AZURE_OPENAI_ENDPOINT` to your Azure OpenAI resource endpoint.
+2. Set `MODEL_MAP` values to your Azure deployment names.
+3. Choose an authentication method (see below).
+
+The proxy uses the Azure OpenAI v1 API: `POST {endpoint}/openai/v1/responses`.
+
+### Authentication
+
+**Option 1: Azure CLI credential (recommended for local development)**
+
+```bash
+# Prerequisites: Azure CLI installed, logged in, and RBAC role assigned
+az login
+az role assignment create \
+  --assignee <your-user-or-principal-id> \
+  --role "Cognitive Services OpenAI User" \
+  --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<resource>
+```
+
+```bash
+AZURE_OPENAI_ENDPOINT=https://myresource.openai.azure.com \
+AZURE_USE_CLI_CREDENTIAL=true \
+MODEL_MAP='{"claude-sonnet-4-6":"my-gpt5-deployment"}' \
+ao-proxy
+```
+
+The proxy automatically acquires and caches Azure AD tokens, refreshing them before expiry.
+
+**Option 2: API key**
+
+```bash
+AZURE_OPENAI_ENDPOINT=https://myresource.openai.azure.com \
+UPSTREAM_API_KEY=<your-azure-api-key> \
+MODEL_MAP='{"claude-sonnet-4-6":"my-gpt5-deployment"}' \
+ao-proxy
+```
+
+When using Azure with an API key, the proxy sends it via the `api-key` header (Azure's convention) instead of `Authorization: Bearer`.
+
+### Azure with Claude Code
+
+```bash
+# Terminal 1
+AZURE_OPENAI_ENDPOINT=https://myresource.openai.azure.com \
+AZURE_USE_CLI_CREDENTIAL=true \
+MODEL_MAP='{"claude-sonnet-4-6":"my-gpt5-deployment"}' \
+ao-proxy
+
+# Terminal 2
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY="any-value" claude
+```
 
 ## Example `.env`
 
@@ -244,6 +301,7 @@ These are the important gaps that remain after the revamp:
 
 - Anthropic `top_k` is not supported by the Responses API. Requests using it are rejected.
 - Anthropic `stop_sequences` are not supported by the Responses API. Requests using them are rejected.
+- Anthropic `max_tokens` values below 16 are clamped to 16 to meet the OpenAI `max_output_tokens` minimum. This commonly occurs with Claude Code's `/context` command, which sends `max_tokens: 1`.
 - GPT-5 family sampling with reasoning is restricted upstream. When thinking is enabled, `temperature` and `top_p` are dropped to avoid upstream errors.
 - Anthropic `tool_result.is_error` has no native Responses equivalent. The proxy encodes the error into the function call output payload.
 - Anthropic thinking history is not lossless when replayed upstream. It is approximated as assistant commentary text.

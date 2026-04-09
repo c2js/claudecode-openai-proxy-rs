@@ -1,7 +1,8 @@
 version: '3'
 
 vars:
-  BINARY_NAME: ao-proxy
+  BINARY_NAME: ao-proxy{{exeExt}}
+  BINARY_STEM: ao-proxy
   INSTALL_DIR: '{{.HOME}}/.cargo/bin'
   BUILD_DIR: target/release
 
@@ -31,9 +32,7 @@ tasks:
     desc: Build and install to ~/.cargo/bin
     deps: [build]
     cmds:
-      - cp {{.BUILD_DIR}}/{{.BINARY_NAME}} {{.INSTALL_DIR}}/{{.BINARY_NAME}}
-      - chmod +x {{.INSTALL_DIR}}/{{.BINARY_NAME}}
-      - echo "✅ Installed to {{.INSTALL_DIR}}/{{.BINARY_NAME}}"
+      - cargo install --path .
 
   local-install:
     desc: Build and install to ~/.cargo/bin (alias for install)
@@ -43,8 +42,7 @@ tasks:
   uninstall:
     desc: Remove installed binary
     cmds:
-      - rm -f {{.INSTALL_DIR}}/{{.BINARY_NAME}}
-      - echo "✅ Uninstalled {{.BINARY_NAME}}"
+      - cargo uninstall {{.BINARY_STEM}}
 
   run:
     desc: Run in development mode
@@ -55,7 +53,7 @@ tasks:
     desc: Run release build
     deps: [build]
     cmds:
-      - ./{{.BUILD_DIR}}/{{.BINARY_NAME}}
+      - '{{.BUILD_DIR}}/{{.BINARY_NAME}}'
 
   test:
     desc: Run all tests
@@ -98,7 +96,6 @@ tasks:
     desc: Clean build artifacts
     cmds:
       - cargo clean
-      - echo "✅ Cleaned build artifacts"
 
   watch:
     desc: Watch and auto-reload on changes
@@ -123,9 +120,17 @@ tasks:
   size:
     desc: Show binary size
     deps: [build]
+    platforms: [linux, darwin]
     cmds:
       - ls -lh {{.BUILD_DIR}}/{{.BINARY_NAME}} | awk '{print "Binary size:", $5}'
       - file {{.BUILD_DIR}}/{{.BINARY_NAME}}
+
+  size-windows:
+    desc: Show binary size (Windows)
+    deps: [build]
+    platforms: [windows]
+    cmds:
+      - powershell -Command "(Get-Item '{{.BUILD_DIR}}/{{.BINARY_NAME}}').Length / 1MB | ForEach-Object { 'Binary size: {0:N2} MB' -f $_ }"
 
   bench:
     desc: Run benchmarks (if any)
@@ -153,8 +158,6 @@ tasks:
       - task: clean
       - task: check
       - task: build
-      - task: size
-      - echo "✅ Release build ready at {{.BUILD_DIR}}/{{.BINARY_NAME}}"
 
   dev:
     desc: Start development server with auto-reload
@@ -165,15 +168,7 @@ tasks:
     desc: Start the proxy server (release mode)
     deps: [build]
     cmds:
-      - |
-        if [ -z "$UPSTREAM_BASE_URL" ]; then
-          echo "⚠️  Error: UPSTREAM_BASE_URL is required"
-          echo "Set it with: export UPSTREAM_BASE_URL=https://openrouter.ai/api"
-          echo "Or OpenAI: export UPSTREAM_BASE_URL=https://api.openai.com"
-          echo "Or local: export UPSTREAM_BASE_URL=http://localhost:11434"
-          exit 1
-        fi
-        ./{{.BUILD_DIR}}/{{.BINARY_NAME}}
+      - '{{.BUILD_DIR}}/{{.BINARY_NAME}}'
 
   help:
     desc: Show help information
@@ -192,7 +187,7 @@ tasks:
       - echo "Environment variables:"
       - echo "  UPSTREAM_BASE_URL            - Upstream endpoint URL (required)"
       - echo "  UPSTREAM_API_KEY             - API key for upstream service"
-      - echo "  PORT                         - Server port (default 3000)"
+      - echo "  PORT                         - Server port (default 18080)"
       - echo "  REASONING_MODEL              - Override model for thinking mode"
       - echo "  COMPLETION_MODEL             - Override model for standard mode"
       - echo "  DEBUG                        - Enable debug logging (1 or true)"

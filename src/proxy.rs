@@ -1,3 +1,4 @@
+use crate::azure::AzureCliCredential;
 use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, responses};
@@ -19,12 +20,46 @@ use std::time::Duration;
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
+    Extension(azure_cred): Extension<Option<AzureCliCredential>>,
     Json(req): Json<anthropic::AnthropicRequest>,
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
 
+    let anthropic_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|c| c.effort.as_deref())
+        .or_else(|| {
+            req.thinking.as_ref().and_then(|t| match t.thinking_type.as_str() {
+                "enabled" | "adaptive" => match t.budget_tokens {
+                    Some(0..=2048) => Some("low (from budget_tokens)"),
+                    Some(2049..=8192) => Some("medium (from budget_tokens)"),
+                    Some(8193..=32768) => Some("high (from budget_tokens)"),
+                    Some(_) => Some("xhigh (from budget_tokens)"),
+                    None => Some("high (default)"),
+                },
+                _ => None,
+            })
+        })
+        .unwrap_or("none")
+        .to_string();
+    let anthropic_model = req.model.clone();
+
     tracing::debug!("Received request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
+
+    if let Some(ref thinking) = req.thinking {
+        tracing::debug!(
+            "Anthropic thinking: type={}, budget_tokens={:?}",
+            thinking.thinking_type,
+            thinking.budget_tokens
+        );
+    }
+    if let Some(ref output) = req.output_config {
+        if let Some(ref effort) = output.effort {
+            tracing::debug!("Anthropic reasoning effort: {}", effort);
+        }
+    }
 
     if config.verbose {
         tracing::trace!(
@@ -35,6 +70,29 @@ pub async fn proxy_handler(
 
     let prepared = transform::anthropic_to_responses(req, &config)?;
 
+    let openai_effort = prepared
+        .upstream_request
+        .reasoning
+        .as_ref()
+        .map(|r| r.effort.as_str())
+        .unwrap_or("none");
+
+    tracing::info!(
+        "{} [effort: {}] -> {} [effort: {}]",
+        anthropic_model,
+        anthropic_effort,
+        prepared.upstream_model,
+        openai_effort,
+    );
+
+    if let Some(ref reasoning) = prepared.upstream_request.reasoning {
+        tracing::debug!(
+            "OpenAI reasoning effort: {} (model: {})",
+            reasoning.effort,
+            prepared.upstream_model
+        );
+    }
+
     if config.verbose {
         tracing::trace!(
             "Transformed Responses request: {}",
@@ -43,9 +101,9 @@ pub async fn proxy_handler(
     }
 
     if is_streaming {
-        handle_streaming(config, client, prepared).await
+        handle_streaming(config, client, azure_cred, prepared).await
     } else {
-        handle_non_streaming(config, client, prepared).await
+        handle_non_streaming(config, client, azure_cred, prepared).await
     }
 }
 
@@ -53,9 +111,38 @@ pub async fn list_models_handler() -> ProxyResult<Response> {
     Ok(Json(transform::supported_models_response()).into_response())
 }
 
+/// Applies the appropriate authentication header to the request.
+async fn apply_auth(
+    config: &Config,
+    azure_cred: &Option<AzureCliCredential>,
+    req_builder: reqwest::RequestBuilder,
+) -> ProxyResult<reqwest::RequestBuilder> {
+    // Azure CLI credential takes priority when configured
+    if config.is_azure() && config.azure_use_cli_credential {
+        if let Some(cred) = azure_cred {
+            let token = cred.get_token().await.map_err(|e| {
+                ProxyError::Config(format!("Azure CLI credential error: {}", e))
+            })?;
+            return Ok(req_builder.header("Authorization", format!("Bearer {}", token)));
+        }
+    }
+
+    if let Some(api_key) = &config.api_key {
+        if config.is_azure() {
+            // Azure OpenAI uses the api-key header for key-based auth
+            return Ok(req_builder.header("api-key", api_key.as_str()));
+        }
+        // Standard OpenAI-compatible: Bearer token
+        return Ok(req_builder.header("Authorization", format!("Bearer {}", api_key)));
+    }
+
+    Ok(req_builder)
+}
+
 async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
+    azure_cred: Option<AzureCliCredential>,
     prepared: transform::PreparedRequest,
 ) -> ProxyResult<Response> {
     let url = config.responses_url();
@@ -67,9 +154,7 @@ async fn handle_non_streaming(
         .json(&prepared.upstream_request)
         .timeout(Duration::from_secs(300));
 
-    if let Some(api_key) = &config.api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-    }
+    req_builder = apply_auth(&config, &azure_cred, req_builder).await?;
 
     let response = req_builder.send().await.map_err(|err| {
         tracing::error!("Failed to send non-streaming request to {}: {:?}", url, err);
@@ -98,6 +183,24 @@ async fn handle_non_streaming(
         );
     }
 
+    let openai_model = upstream_resp.model.as_deref().unwrap_or("unknown");
+    let usage = upstream_resp.usage.as_ref();
+    let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
+    let output_tokens = usage.map(|u| u.output_tokens).unwrap_or(0);
+    let reasoning_tokens = usage
+        .and_then(|u| u.output_tokens_details.as_ref())
+        .and_then(|d| d.reasoning_tokens)
+        .unwrap_or(0);
+    tracing::info!(
+        "{} <- {} id={} tokens(i={}, o={}, r={})",
+        prepared.anthropic_model,
+        openai_model,
+        truncate_resp_id(&upstream_resp.id),
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+    );
+
     let anthropic_resp =
         transform::responses_to_anthropic(upstream_resp, &prepared.anthropic_model)?;
 
@@ -114,6 +217,7 @@ async fn handle_non_streaming(
 async fn handle_streaming(
     config: Arc<Config>,
     client: Client,
+    azure_cred: Option<AzureCliCredential>,
     prepared: transform::PreparedRequest,
 ) -> ProxyResult<Response> {
     let url = config.responses_url();
@@ -125,9 +229,7 @@ async fn handle_streaming(
         .json(&prepared.upstream_request)
         .timeout(Duration::from_secs(300));
 
-    if let Some(api_key) = &config.api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-    }
+    req_builder = apply_auth(&config, &azure_cred, req_builder).await?;
 
     let response = req_builder.send().await.map_err(|err| {
         tracing::error!("Failed to send streaming request to {}: {:?}", url, err);
@@ -448,6 +550,24 @@ fn create_sse_stream(
                             }
                             responses::ResponseStreamEvent::ResponseCompleted { response }
                             | responses::ResponseStreamEvent::ResponseIncomplete { response } => {
+                                let openai_model = response.model.as_deref().unwrap_or("unknown");
+                                let usage = response.usage.as_ref();
+                                let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
+                                let output_tokens = usage.map(|u| u.output_tokens).unwrap_or(0);
+                                let reasoning_tokens = usage
+                                    .and_then(|u| u.output_tokens_details.as_ref())
+                                    .and_then(|d| d.reasoning_tokens)
+                                    .unwrap_or(0);
+                                tracing::info!(
+                                    "{} <- {} id={} tokens(i={}, o={}, r={})",
+                                    anthropic_model,
+                                    openai_model,
+                                    truncate_resp_id(&response.id),
+                                    input_tokens,
+                                    output_tokens,
+                                    reasoning_tokens,
+                                );
+
                                 if let Some(stop) = close_current_block(&mut current_block, &mut content_index) {
                                     yield Ok(Bytes::from(stop));
                                 }
@@ -710,4 +830,11 @@ fn render_event(event_name: &str, payload: serde_json::Value) -> String {
         event_name,
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
     )
+}
+
+fn truncate_resp_id(id: &str) -> String {
+    match id.strip_prefix("resp_") {
+        Some(rest) if rest.len() > 10 => format!("resp_{}...", &rest[..10]),
+        _ => id.to_string(),
+    }
 }
